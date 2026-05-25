@@ -1,0 +1,8 @@
+.env
+posted_items.json
+json
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
