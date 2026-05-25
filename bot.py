@@ -23,7 +23,7 @@ from telegram import Bot
 
 load_dotenv(".env")
 
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+CHAT_ID = int(os.getenv("CHAT_ID", "-1003492949456"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "posted_items.json"))
 POST_INTERVAL_MINUTES = int(os.getenv("POST_INTERVAL_MINUTES", "180"))
 MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
@@ -31,11 +31,11 @@ HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
 SSL_VERIFY = os.getenv("SSL_VERIFY", "true").lower() not in {"0", "false", "no"}
 
 TOPICS = {
-    "jobs": int(os.getenv("TOPIC_JOBS", "0")),
-    "career": int(os.getenv("TOPIC_CAREER", "0")),
-    "events": int(os.getenv("TOPIC_EVENTS", "0")),
-    "channels": int(os.getenv("TOPIC_CHANNELS", "0")),
-    "soft_skills": int(os.getenv("TOPIC_SOFT_SKILLS", "0")),
+    "jobs": int(os.getenv("TOPIC_JOBS", "5")),
+    "career": int(os.getenv("TOPIC_CAREER", "7")),
+    "events": int(os.getenv("TOPIC_EVENTS", "6")),
+    "channels": int(os.getenv("TOPIC_CHANNELS", "597")),
+    "soft_skills": int(os.getenv("TOPIC_SOFT_SKILLS", "694")),
 }
 
 DEFAULT_TOPIC_CONFIG = {
@@ -190,6 +190,90 @@ def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def looks_garbled(text: str) -> bool:
+    if not text:
+        return True
+    bad_markers = ("�", "â", "Ã", "å", "é¡", "ï¼", "ã")
+    return any(marker in text for marker in bad_markers)
+
+
+def latin_letter_ratio(text: str) -> float:
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return 0.0
+    latin_letters = [
+        char
+        for char in letters
+        if ("A" <= char <= "Z")
+        or ("a" <= char <= "z")
+        or char in "ÀÁÂÄÈÉÊËÌÍÎÏÒÓÔÖÙÚÛÜàáâäèéêëìíîïòóôöùúûüÇç"
+    ]
+    return len(latin_letters) / len(letters)
+
+
+def language_priority(item: ContentItem) -> int | None:
+    text = clean_text(f"{item.title} {item.summary}")
+    if looks_garbled(text) or latin_letter_ratio(text) < 0.85:
+        return None
+
+    words = set(re.findall(r"[a-zà-ÿ']+", text.lower()))
+    english_markers = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "your",
+        "job",
+        "jobs",
+        "career",
+        "developer",
+        "python",
+        "interview",
+        "skills",
+        "english",
+        "remote",
+        "students",
+        "work",
+    }
+    italian_markers = {
+        "il",
+        "lo",
+        "la",
+        "gli",
+        "le",
+        "un",
+        "una",
+        "per",
+        "con",
+        "di",
+        "del",
+        "della",
+        "carriera",
+        "lavoro",
+        "torino",
+        "italia",
+    }
+    english_score = len(words & english_markers)
+    italian_score = len(words & italian_markers)
+
+    if english_score >= max(1, italian_score):
+        return 0
+    if italian_score:
+        return 1
+    return 0
+
+
+def prioritize_items(items: Iterable[ContentItem]) -> list[ContentItem]:
+    prioritized: list[tuple[int, int, ContentItem]] = []
+    for index, item in enumerate(dedupe_items(items)):
+        priority = language_priority(item)
+        if priority is None:
+            logging.info("Rejected unreadable/non-English-Italian item: %s", item.title[:100])
+            continue
+        prioritized.append((priority, index, item))
+    return [item for _, _, item in sorted(prioritized, key=lambda entry: (entry[0], entry[1]))]
+
+
 def normalize_duckduckgo_url(url: str) -> str:
     if not url:
         return ""
@@ -277,10 +361,13 @@ def ssl_context() -> ssl.SSLContext:
 def search_web(query: str, allowed_domains: Iterable[str], limit: int = 5) -> list[ContentItem]:
     search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
     parser = DuckDuckGoParser()
-    parser.feed(fetch_text(search_url))
-    results = [item for item in parser.results if domain_allowed(item.url, allowed_domains)][:limit]
-    if results:
-        return results
+    try:
+        parser.feed(fetch_text(search_url))
+        results = [item for item in parser.results if domain_allowed(item.url, allowed_domains)][:limit]
+        if results:
+            return results
+    except Exception as exc:
+        logging.warning("DuckDuckGo search failed for %s: %s", query, exc)
     return search_bing_news(query, allowed_domains, limit=limit)
 
 
@@ -461,8 +548,14 @@ def collect_candidates(topic_name: str, topic: dict) -> list[ContentItem]:
         except Exception as exc:
             logging.warning("YouTube search failed for %s: %s", query, exc)
 
-    logging.info("Collected %s candidates for %s.", len(candidates), topic_name)
-    return dedupe_items(candidates)
+    prioritized = prioritize_items(candidates)
+    logging.info(
+        "Collected %s candidates for %s; kept %s English/Italian readable item(s).",
+        len(candidates),
+        topic_name,
+        len(prioritized),
+    )
+    return prioritized
 
 
 def dedupe_items(items: Iterable[ContentItem]) -> list[ContentItem]:
