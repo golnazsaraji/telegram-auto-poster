@@ -45,7 +45,7 @@ python bot.py --once
 python bot.py
 ```
 
-By default it runs every 180 minutes and posts up to 3 fresh items per run. Change `POST_INTERVAL_MINUTES` and `MAX_POSTS_PER_RUN` in `.env` if needed.
+By default it runs every 180 minutes and posts up to 8 fresh items per run, with up to 5 job opportunities from Turin/Torino job boards. Job opportunities are limited to postings from the last 30 days. Change `POST_INTERVAL_MINUTES`, `MAX_POSTS_PER_RUN`, `JOBS_PER_RUN`, `RESULTS_PER_SOURCE`, and `JOB_MAX_AGE_DAYS` in `.env` if needed.
 
 If your local Python reports certificate verification errors during testing, install/update `certifi` with the requirements command above. For a temporary local-only dry run, you can set `SSL_VERIFY=false` in `.env`.
 
@@ -60,9 +60,11 @@ You can override or add sources with a JSON config file and point `CONTENT_CONFI
 ```json
 {
   "jobs": {
-    "queries": ["English speaking software jobs Turin"],
-    "rss_feeds": ["https://remoteok.com/remote-python-jobs.rss"],
-    "allowed_domains": ["remoteok.com", "linkedin.com", "indeed.com"]
+    "job_fields": ["software developer", "data analyst", "marketing"],
+    "job_engines": ["linkedin", "indeed"],
+    "job_location": "Torino, Piedmont, Italy",
+    "required_terms": ["turin", "torino"],
+    "posts_per_run": 5
   }
 }
 ```

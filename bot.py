@@ -9,7 +9,8 @@ import re
 import ssl
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
@@ -26,9 +27,12 @@ load_dotenv(".env")
 CHAT_ID = int(os.getenv("CHAT_ID", "-1003492949456"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "posted_items.json"))
 POST_INTERVAL_MINUTES = int(os.getenv("POST_INTERVAL_MINUTES", "180"))
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "8"))
+RESULTS_PER_SOURCE = int(os.getenv("RESULTS_PER_SOURCE", "10"))
+JOB_MAX_AGE_DAYS = int(os.getenv("JOB_MAX_AGE_DAYS", "30"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
 SSL_VERIFY = os.getenv("SSL_VERIFY", "true").lower() not in {"0", "false", "no"}
+USE_DUCKDUCKGO = os.getenv("USE_DUCKDUCKGO", "false").lower() in {"1", "true", "yes"}
 
 TOPICS = {
     "jobs": int(os.getenv("TOPIC_JOBS", "5")),
@@ -41,22 +45,39 @@ TOPICS = {
 DEFAULT_TOPIC_CONFIG = {
     "jobs": {
         "title": "Jobs",
-        "queries": [
-            "English speaking jobs Turin",
-            "junior developer jobs Turin",
-            "international jobs Torino",
+        "posts_per_run": int(os.getenv("JOBS_PER_RUN", "5")),
+        "job_location": "Torino, Piedmont, Italy",
+        "job_fields": [
+            "software developer",
+            "data analyst",
+            "artificial intelligence",
+            "mechanical engineer",
+            "marketing",
+            "sales",
+            "finance",
+            "product manager",
+            "designer",
+            "human resources",
+            "customer support",
+            "logistics",
+            "research engineer",
         ],
-        "rss_feeds": [
-            "https://remoteok.com/remote-python-jobs.rss",
-        ],
+        "job_engines": ["linkedin", "indeed"],
+        "queries": [],
+        "rss_feeds": [],
         "allowed_domains": [
             "linkedin.com",
             "indeed.com",
             "glassdoor.com",
-            "remoteok.com",
+            "infojobs.it",
+            "monster.it",
+            "randstad.it",
+            "adecco.it",
+            "manpower.it",
             "euraxess.ec.europa.eu",
             "eures.europa.eu",
         ],
+        "required_terms": ["turin", "torino"],
     },
     "career": {
         "title": "Career",
@@ -265,13 +286,20 @@ def language_priority(item: ContentItem) -> int | None:
 
 def prioritize_items(items: Iterable[ContentItem]) -> list[ContentItem]:
     prioritized: list[tuple[int, int, ContentItem]] = []
-    for index, item in enumerate(dedupe_items(items)):
+    for index, item in enumerate(filter_readable_items(items)):
         priority = language_priority(item)
-        if priority is None:
-            logging.info("Rejected unreadable/non-English-Italian item: %s", item.title[:100])
-            continue
         prioritized.append((priority, index, item))
     return [item for _, _, item in sorted(prioritized, key=lambda entry: (entry[0], entry[1]))]
+
+
+def filter_readable_items(items: Iterable[ContentItem]) -> list[ContentItem]:
+    readable = []
+    for item in dedupe_items(items):
+        if language_priority(item) is None:
+            logging.info("Rejected unreadable/non-English-Italian item: %s", item.title[:100])
+            continue
+        readable.append(item)
+    return readable
 
 
 def normalize_duckduckgo_url(url: str) -> str:
@@ -332,15 +360,20 @@ def save_state(posted_ids: set[str]) -> None:
         json.dump(payload, state_file, indent=2)
 
 
-def fetch_text(url: str) -> str:
+def fetch_text(url: str, timeout: int | None = None) -> str:
     request = Request(
         url,
         headers={
-            "User-Agent": "TelegramContentBot/1.0",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0 Safari/537.36"
+            ),
             "Accept": "text/html,application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
         },
     )
-    with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS, context=ssl_context()) as response:
+    with urlopen(request, timeout=timeout or HTTP_TIMEOUT_SECONDS, context=ssl_context()) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read().decode(charset, errors="replace")
 
@@ -359,10 +392,13 @@ def ssl_context() -> ssl.SSLContext:
 
 
 def search_web(query: str, allowed_domains: Iterable[str], limit: int = 5) -> list[ContentItem]:
+    if not USE_DUCKDUCKGO:
+        return search_bing_news(query, allowed_domains, limit=limit)
+
     search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
     parser = DuckDuckGoParser()
     try:
-        parser.feed(fetch_text(search_url))
+        parser.feed(fetch_text(search_url, timeout=5))
         results = [item for item in parser.results if domain_allowed(item.url, allowed_domains)][:limit]
         if results:
             return results
@@ -526,29 +562,251 @@ def text_from_runs(value: dict | list | str) -> str:
     return ""
 
 
+def parse_datetime(value: str) -> datetime | None:
+    value = clean_text(value)
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is None:
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_relative_age(value: str, now: datetime | None = None) -> datetime | None:
+    text = clean_text(value).lower()
+    if not text:
+        return None
+    now = now or datetime.now(timezone.utc)
+    if any(marker in text for marker in ("today", "just posted", "just now", "now")):
+        return now
+    if "yesterday" in text:
+        return now - timedelta(days=1)
+
+    match = re.search(
+        r"(\d+)\+?\s*(minute|hour|day|week|month)s?\s*ago|posted\s*(\d+)\+?\s*(minute|hour|day|week|month)s?",
+        text,
+    )
+    if not match:
+        return None
+
+    amount = int(match.group(1) or match.group(3))
+    unit = match.group(2) or match.group(4)
+    if unit == "minute":
+        delta = timedelta(minutes=amount)
+    elif unit == "hour":
+        delta = timedelta(hours=amount)
+    elif unit == "day":
+        delta = timedelta(days=amount)
+    elif unit == "week":
+        delta = timedelta(weeks=amount)
+    else:
+        delta = timedelta(days=amount * 30)
+    return now - delta
+
+
+def job_date_from_fragment(fragment: str) -> str:
+    patterns = [
+        r'<time[^>]+datetime="([^"]+)"',
+        r'"datePosted"\s*:\s*"([^"]+)"',
+        r'"datePublished"\s*:\s*"([^"]+)"',
+        r'"listedAt"\s*:\s*(\d{10,13})',
+        r'"pubDate"\s*:\s*(\d{10,13})',
+        r'"formattedRelativeTime"\s*:\s*"((?:\\.|[^"])*)"',
+        r'"relativeTime"\s*:\s*"((?:\\.|[^"])*)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, fragment)
+        if not match:
+            continue
+        value = decode_json_string(match.group(1))
+        if value.isdigit():
+            timestamp = int(value)
+            if timestamp > 9_999_999_999:
+                timestamp //= 1000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+        return value
+    return ""
+
+
+def is_recent_job(item: ContentItem, max_age_days: int = JOB_MAX_AGE_DAYS) -> bool:
+    now = datetime.now(timezone.utc)
+    published_at = parse_datetime(item.published) or parse_relative_age(item.published, now=now)
+    if not published_at:
+        logging.info("Rejected job without a verifiable posting date: %s", item.title[:100])
+        return False
+    cutoff = now - timedelta(days=max_age_days)
+    if published_at < cutoff:
+        logging.info("Rejected job older than %s day(s): %s", max_age_days, item.title[:100])
+        return False
+    return True
+
+
+def collect_job_engine_candidates(topic: dict, limit: int = 5) -> list[ContentItem]:
+    fields = topic.get("job_fields", [])
+    location = topic.get("job_location", "Torino, Piedmont, Italy")
+    engines = set(topic.get("job_engines", []))
+    field_results: list[list[ContentItem]] = []
+
+    for field in fields:
+        candidates: list[ContentItem] = []
+        if "linkedin" in engines:
+            try:
+                candidates.extend(search_linkedin_jobs(field, location, limit=limit))
+            except Exception as exc:
+                logging.warning("LinkedIn job search failed for %s: %s", field, exc)
+        if "indeed" in engines:
+            try:
+                candidates.extend(search_indeed_jobs(field, "Torino, Piemonte", limit=limit))
+            except Exception as exc:
+                logging.warning("Indeed job search failed for %s: %s", field, exc)
+        if candidates:
+            field_results.append(dedupe_items(candidates))
+
+    return interleave_items(field_results)
+
+
+def interleave_items(item_groups: Iterable[list[ContentItem]]) -> list[ContentItem]:
+    groups = [group for group in item_groups if group]
+    interleaved = []
+    max_length = max((len(group) for group in groups), default=0)
+    for index in range(max_length):
+        for group in groups:
+            if index < len(group):
+                interleaved.append(group[index])
+    return dedupe_items(interleaved)
+
+
+def search_linkedin_jobs(field: str, location: str, limit: int = 5) -> list[ContentItem]:
+    recent_window_seconds = JOB_MAX_AGE_DAYS * 24 * 60 * 60
+    search_url = (
+        "https://www.linkedin.com/jobs/search/"
+        f"?keywords={quote_plus(field)}&location={quote_plus(location)}"
+        f"&f_TPR=r{recent_window_seconds}&sortBy=DD"
+    )
+    page = fetch_text(search_url, timeout=10)
+    results = []
+    pattern = re.compile(r'<a[^>]+href="([^"]+/jobs/view/[^"]+)"[^>]*>(.*?)</a>', re.S)
+
+    for match in pattern.finditer(page):
+        url, raw_title = match.groups()
+        title = clean_text(raw_title)
+        if not title:
+            continue
+        fragment = page[max(0, match.start() - 3000) : match.end() + 6000]
+        published = job_date_from_fragment(fragment)
+        normalized_url = normalize_job_url(html.unescape(url))
+        item = ContentItem(
+            title=title,
+            url=normalized_url,
+            source="linkedin.com",
+            summary=f"{field.title()} opportunity in Torino/Turin.",
+            published=published,
+        )
+        if not is_recent_job(item):
+            continue
+        results.append(item)
+        if len(results) >= limit:
+            break
+
+    return dedupe_items(results)
+
+
+def search_indeed_jobs(field: str, location: str, limit: int = 5) -> list[ContentItem]:
+    search_url = (
+        f"https://it.indeed.com/jobs?q={quote_plus(field)}&l={quote_plus(location)}"
+        f"&sort=date&fromage={JOB_MAX_AGE_DAYS}"
+    )
+    page = fetch_text(search_url, timeout=10)
+    results = []
+
+    for match in re.finditer(r'"jobTitle":"((?:\\.|[^"])*)"', page):
+        window = page[max(0, match.start() - 3000) : match.start() + 6000]
+        key_match = re.search(r'"jobkey":"([^"]+)"', window)
+        if not key_match:
+            continue
+
+        title = clean_text(decode_json_string(match.group(1)))
+        location_match = re.search(r'"formattedLocation":"((?:\\.|[^"])*)"', window)
+        subtitle_match = re.search(r'"subtitle":"((?:\\.|[^"])*)"', window)
+        job_location = decode_json_string(location_match.group(1)) if location_match else "Torino"
+        subtitle = decode_json_string(subtitle_match.group(1)) if subtitle_match else job_location
+        if title and item_matches_terms(ContentItem(title, "", "", summary=job_location), ["torino", "turin"]):
+            published = job_date_from_fragment(window)
+            item = ContentItem(
+                title=title,
+                url=f"https://it.indeed.com/viewjob?jk={key_match.group(1)}",
+                source="indeed.com",
+                summary=clean_text(subtitle),
+                published=published,
+            )
+            if not is_recent_job(item):
+                continue
+            results.append(item)
+        if len(dedupe_items(results)) >= limit:
+            break
+
+    return dedupe_items(results)[:limit]
+
+
+def decode_json_string(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        return value
+
+
+def normalize_job_url(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed._replace(query="", fragment="").geturl()
+
+
 def collect_candidates(topic_name: str, topic: dict) -> list[ContentItem]:
     allowed_domains = topic.get("allowed_domains", [])
+    required_terms = [term.lower() for term in topic.get("required_terms", [])]
     candidates: list[ContentItem] = []
+
+    if topic_name == "jobs":
+        try:
+            candidates.extend(collect_job_engine_candidates(topic, limit=RESULTS_PER_SOURCE))
+        except Exception as exc:
+            logging.warning("Direct job engine search failed for %s: %s", topic_name, exc)
 
     for feed_url in topic.get("rss_feeds", []):
         try:
-            candidates.extend(read_rss_feed(feed_url, allowed_domains))
+            candidates.extend(read_rss_feed(feed_url, allowed_domains, limit=RESULTS_PER_SOURCE))
         except Exception as exc:
             logging.warning("RSS source failed for %s: %s", feed_url, exc)
 
     for query in topic.get("queries", []):
         try:
-            candidates.extend(search_web(query, allowed_domains))
+            candidates.extend(search_web(query, allowed_domains, limit=RESULTS_PER_SOURCE))
         except Exception as exc:
             logging.warning("Web search failed for %s: %s", query, exc)
 
     for query in topic.get("youtube_queries", []):
         try:
-            candidates.extend(search_youtube(query))
+            candidates.extend(search_youtube(query, limit=RESULTS_PER_SOURCE))
         except Exception as exc:
             logging.warning("YouTube search failed for %s: %s", query, exc)
 
-    prioritized = prioritize_items(candidates)
+    if topic_name == "jobs":
+        candidates = [item for item in candidates if is_recent_job(item)]
+
+    if required_terms:
+        candidates = [item for item in candidates if item_matches_terms(item, required_terms)]
+
+    prioritized = filter_readable_items(candidates) if topic_name == "jobs" else prioritize_items(candidates)
     logging.info(
         "Collected %s candidates for %s; kept %s English/Italian readable item(s).",
         len(candidates),
@@ -556,6 +814,11 @@ def collect_candidates(topic_name: str, topic: dict) -> list[ContentItem]:
         len(prioritized),
     )
     return prioritized
+
+
+def item_matches_terms(item: ContentItem, required_terms: Iterable[str]) -> bool:
+    text = f"{item.title} {item.summary} {item.url}".lower()
+    return any(term in text for term in required_terms)
 
 
 def dedupe_items(items: Iterable[ContentItem]) -> list[ContentItem]:
@@ -622,16 +885,21 @@ async def run_once(dry_run: bool = False) -> int:
             continue
 
         candidates = collect_candidates(topic_name, topic)
-        next_item = next((item for item in candidates if item.stable_id not in seen_this_run), None)
-        if not next_item:
+        fresh_items = [item for item in candidates if item.stable_id not in seen_this_run]
+        if not fresh_items:
             logging.info("No fresh item found for %s.", topic_name)
             continue
 
-        await post_item(bot, topic_name, topic, next_item, dry_run)
-        seen_this_run.add(next_item.stable_id)
-        if not dry_run:
-            posted_ids.add(next_item.stable_id)
-        posted_count += 1
+        topic_limit = max(1, int(topic.get("posts_per_run", 1)))
+        for item in fresh_items[:topic_limit]:
+            await post_item(bot, topic_name, topic, item, dry_run)
+            seen_this_run.add(item.stable_id)
+            if not dry_run:
+                posted_ids.add(item.stable_id)
+            posted_count += 1
+
+            if posted_count >= MAX_POSTS_PER_RUN:
+                break
 
         if posted_count >= MAX_POSTS_PER_RUN:
             break
